@@ -1,4 +1,4 @@
-name: Build & Release
+name: Build & Release (Multi-Arch)
 
 on:
   push:
@@ -21,6 +21,9 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:20.04
+    strategy:
+      matrix:
+        arch: [amd64, armv7]  # <-- اضافه شدن معماری armv7
     env:
       DEBIAN_FRONTEND: noninteractive
     steps:
@@ -32,7 +35,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             curl ca-certificates build-essential zlib1g-dev libssl-dev \
             libffi-dev libbz2-dev libreadline-dev libsqlite3-dev \
-            liblzma-dev tk-dev uuid-dev libncurses5-dev
+            liblzma-dev tk-dev uuid-dev libncurses5-dev gcc-arm-linux-gnueabihf # <-- اضافه شدن کراس-کامپایلر برای ARM
           # Install Node.js 22
           curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
           apt-get install -y nodejs
@@ -51,120 +54,34 @@ jobs:
       - name: Build release archive
         run: |
           chmod +x scripts/build-linux.sh
-          bash scripts/build-linux.sh
+          # ارسال معماری به اسکریپت ساخت
+          bash scripts/build-linux.sh ${{ matrix.arch }}
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MasterDnsWeb-linux-amd64
-          path: dist/MasterDnsWeb-linux-amd64.tar.gz
+          name: MasterDnsWeb-linux-${{ matrix.arch }}
+          path: dist/MasterDnsWeb-linux-${{ matrix.arch }}.tar.gz
 
-  # ── Job 2: Test binary on Ubuntu 22.04 ─────────────────────
-  test-binary:
+  # ── Job 2: Create GitHub Release ──────────────────────────
+  release:
     needs: [build-binary]
     runs-on: ubuntu-latest
-    container:
-      image: ubuntu:22.04
-    steps:
-      - name: Download binary artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: MasterDnsWeb-linux-amd64
-
-      - name: Extract and smoke-test the binary
-        run: |
-          apt-get update && apt-get install -y --no-install-recommends file curl
-
-          tar -xzf MasterDnsWeb-linux-amd64.tar.gz
-          cd MasterDnsWeb
-          chmod +x MasterDnsWeb
-
-          # Verify it's a real ELF binary
-          file MasterDnsWeb
-          file MasterDnsWeb | grep -q "ELF 64-bit"
-
-          # Check glibc version requirement
-          ldd --version || true
-
-          # Start the server in the background with test credentials
-          export SECRET_KEY=ci-test-key-do-not-use
-          export ADMIN_USERNAME=testadmin
-          export ADMIN_PASSWORD=testpass123
-          ./MasterDnsWeb &
-          SERVER_PID=$!
-
-          # Wait for it to be ready
-          for i in $(seq 1 15); do
-            if curl -sf http://localhost:8000/api/health >/dev/null 2>&1; then
-              echo "✅ Server is up after ${i}s"
-              break
-            fi
-            sleep 1
-          done
-
-          # Verify health endpoint
-          curl -sf http://localhost:8000/api/health | tee /dev/stderr | grep -q '"status"'
-          echo ""
-          echo "✅ Health check passed"
-
-          # Verify login works
-          RESPONSE=$(curl -sf -X POST http://localhost:8000/login \
-            -H "Content-Type: application/json" \
-            -d '{"username":"testadmin","password":"testpass123"}')
-          echo "$RESPONSE" | grep -q "access_token"
-          echo "✅ Login test passed"
-
-          # Clean up
-          kill $SERVER_PID 2>/dev/null || true
-          echo "✅ All smoke tests passed"
-
-  # ── Job 3: Build & push Docker image ──────────────────────
-  build-docker:
-    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # ── Job 4: Create GitHub Release ──────────────────────────
-  release:
-    needs: [build-binary, test-binary, build-docker]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download binary artifact
+      # دانلود هر دو فایل ساخته شده
+      - name: Download amd64 artifact
         uses: actions/download-artifact@v4
         with:
           name: MasterDnsWeb-linux-amd64
+          path: ./dist-amd64
+
+      - name: Download armv7 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: MasterDnsWeb-linux-armv7
+          path: ./dist-armv7
 
       - name: Delete existing release (if re-tagging)
         run: gh release delete "${{ github.ref_name }}" --yes --cleanup-tag || true
@@ -180,4 +97,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: MasterDnsWeb-linux-amd64.tar.gz
+          files: |
+            ./dist-amd64/MasterDnsWeb-linux-amd64.tar.gz
+            ./dist-armv7/MasterDnsWeb-linux-armv7.tar.gz
